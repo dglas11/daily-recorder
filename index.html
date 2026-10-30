@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>日报逐句录音台</title>
+<style>
+body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;max-width:760px;margin:24px auto;padding:0 16px 64px;color:#222;line-height:1.6}
+h1{font-size:21px;margin-bottom:4px} h2{font-size:16px;margin-top:28px}
+.muted{color:#666;font-size:13px}
+.diag{background:#f6f6f6;border:1px solid #ddd;border-radius:8px;padding:10px 14px;font-size:13px;white-space:pre-wrap;word-break:break-all}
+.line{border:1px solid #ddd;border-radius:10px;padding:12px 14px;margin:12px 0}
+.line .text{font-size:17px;font-weight:600;margin:4px 0 8px}
+.line .no{color:#888;font-size:13px}
+button{padding:8px 14px;margin:4px 8px 4px 0;border-radius:8px;border:1px solid #ccc;background:#fff;cursor:pointer;font-size:14px}
+button.rec-on{background:#d92d20;color:#fff;border-color:#d92d20}
+button.primary{background:#0e7490;color:#fff;border-color:#0e7490;font-size:16px;padding:12px 22px}
+button:disabled{opacity:.45;cursor:default}
+.status{font-size:13px;color:#555;margin-top:6px}
+.done{color:#079455;font-weight:600}
+.missing{color:#d92d20;font-weight:600}
+input[type=text],input[type=password],textarea{width:100%;font-size:15px;padding:9px;box-sizing:border-box;margin:6px 0;border:1px solid #ccc;border-radius:8px}
+audio{display:block;margin-top:8px;width:100%}
+.err{background:#fdf0ef;border:1px solid #f1c6c2;border-radius:8px;padding:10px 14px;font-size:13px;white-space:pre-wrap;word-break:break-all;color:#8a1f16}
+.ok{background:#ecfdf3;border:1px solid #a6e9c5;border-radius:8px;padding:10px 14px;font-size:14px}
+.progress{font-size:14px;margin-top:10px;white-space:pre-wrap}
+.card{border:1px solid #ddd;border-radius:10px;padding:14px 16px;margin:14px 0}
+</style>
+</head>
+<body>
+<h1>日报逐句录音台</h1>
+<p class="muted">逐句录音：每句点「录音」念一遍，点「停止」结束；可试听、可重录。录音会存在本浏览器里，刷新不丢。全部录完点页面底部「提交并渲染」。</p>
+<div class="diag" id="diag">环境检测中…</div>
+
+<div class="card" id="sessionCard">
+  <div><strong>会话码</strong></div>
+  <input type="text" id="sessionInput" placeholder="例如 A3F9K2（链接里 ?s= 后面的那串）">
+  <button id="loadSessionBtn">加载本期口播</button>
+  <div class="status" id="sessionStatus"></div>
+  <div id="payloadFallback" style="display:none">
+    <div class="status">自动读取失败。可以把本期数据（payload JSON）粘贴到下面，手动加载：</div>
+    <textarea id="payloadPaste" rows="5" placeholder='{"edition":"10-31","slug":"10-31","lines":["第一行","第二行"]}'></textarea>
+    <button id="usePasteBtn">使用粘贴的数据</button>
+  </div>
+</div>
+
+<div class="card" id="settingsCard">
+  <div><strong>上传口令（GitHub 令牌）</strong></div>
+  <div class="status">首次使用粘贴一次即可，只存在这台设备的浏览器里，只发送给 api.github.com。收件仓库：<span id="repoHint">daily-audio-inbox</span></div>
+  <input type="password" id="tokenInput" placeholder="粘贴 GitHub 令牌（github_pat_…）" autocomplete="off">
+  <button id="saveTokenBtn">保存口令</button>
+  <span class="status" id="tokenStatus"></span>
+  <div class="status">仓库归属账号（owner）：<span id="ownerHint">（未识别）</span>
+    <details><summary>识别不对？手动填 owner</summary>
+      <input type="text" id="ownerInput" placeholder="GitHub 用户名，例如 dailu">
+      <button id="saveOwnerBtn">保存 owner</button>
+    </details>
+  </div>
+</div>
+
+<h2 id="linesTitle" style="display:none">本期口播</h2>
+<div class="status" id="editionInfo"></div>
+<div id="lines"></div>
+
+<div id="submitArea" style="display:none">
+  <div class="status" id="summary"></div>
+  <div class="err" id="missingBox" style="display:none"></div>
+  <p><button class="primary" id="submitBtn">提交并渲染</button></p>
+  <div class="progress" id="submitProgress"></div>
+  <div id="submitResult"></div>
+</div>
+
+<script>
+'use strict';
+/* ============ 工具 ============ */
+const $ = id => document.getElementById(id);
+const INBOX_REPO = 'daily-audio-inbox';
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function fmtDur(sec){ if (sec == null || isNaN(sec)) return ''; return '时长 ' + sec.toFixed(1) + ' 秒'; }
+
+/* ============ 环境诊断 ============ */
+(function diag(){
+  const d = [];
+  d.push('location.protocol = ' + location.protocol + ' / host = ' + location.hostname);
+  d.push('window.isSecureContext = ' + window.isSecureContext);
+  d.push('是否嵌在 iframe 中: ' + (window.self !== window.top));
+  let af = null;
+  try { if (document.permissionsPolicy) af = document.permissionsPolicy.allowsFeature('microphone'); } catch(e){}
+  if (af === null) { try { if (document.featurePolicy) af = document.featurePolicy.allowsFeature('microphone'); } catch(e){} }
+  d.push("Permissions-Policy allowsFeature('microphone') = " + (af === null ? '(查询不可用)' : af));
+  d.push('navigator.mediaDevices = ' + (navigator.mediaDevices ? '存在' : '不存在'));
+  d.push('window.MediaRecorder = ' + typeof window.MediaRecorder);
+  $('diag').textContent = d.join('\n');
+  if (navigator.permissions && navigator.permissions.query) {
+    navigator.permissions.query({name:'microphone'}).then(r => {
+      $('diag').textContent += '\nPermissions API microphone 状态 = ' + r.state + '（granted=已授权 / denied=已拒绝 / prompt=未问过）';
+    }).catch(()=>{});
+  }
+})();
+
+/* ============ IndexedDB（录音本地留存，刷新不丢） ============ */
+const idb = {
+  db: null,
+  open(){
+    return new Promise((resolve, reject) => {
+      if (idb.db) return resolve(idb.db);
+      const req = indexedDB.open('recorder', 1);
+      req.onupgradeneeded = () => { req.result.createObjectStore('clips'); };
+      req.onsuccess = () => { idb.db = req.result; resolve(idb.db); };
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async put(key, value){
+    const db = await idb.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('clips', 'readwrite');
+      tx.objectStore('clips').put(value, key);
+      tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+    });
+  },
+  async get(key){
+    const db = await idb.open();
+    return new Promise((resolve, reject) => {
+      const req = db.transaction('clips', 'readonly').objectStore('clips').get(key);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async del(key){
+    const db = await idb.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('clips', 'readwrite');
+      tx.objectStore('clips').delete(key);
+      tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+    });
+  }
+};
+const clipKey = idx => sessionCode + ':' + idx;
+
+/* ============ 状态 ============ */
+let sessionCode = '';
+let payload = null;            // {edition, slug, lines[]}
+let clips = {};                // idx -> {blob, duration}
+let rowUI = [];                // idx -> {statusEl, playBtn, rerecordBtn, recBtn, audioEl}
+let stream = null;
+let activeRec = null;          // {idx, recorder, chunks, t0, timer}
+
+async function getStream(){
+  if (stream) return stream;
+  stream = await navigator.mediaDevices.getUserMedia({audio:true});
+  return stream;
+}
+
+/* ============ 会话与数据加载 ============ */
+async function loadSession(code){
+  sessionCode = code;
+  $('sessionStatus').textContent = '正在读取本期数据…';
+  $('payloadFallback').style.display = 'none';
+  try {
+    const r = await fetch('./sessions/' + encodeURIComponent(code) + '/payload.json', {cache:'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status + '（./sessions/' + code + '/payload.json）');
+    const p = await r.json();
+    initPayload(p, code);
+  } catch(e) {
+    $('sessionStatus').innerHTML = '<span class="missing">读取失败：' + esc(e.message || e) + '</span> 可以粘贴数据手动加载，或确认会话码无误后重试。';
+    $('payloadFallback').style.display = 'block';
+  }
+}
+function initPayload(p, code){
+  if (!p || !Array.isArray(p.lines) || !p.lines.length) {
+    $('sessionStatus').innerHTML = '<span class="missing">数据格式不对：缺少 lines 数组。</span>';
+    $('payloadFallback').style.display = 'block';
+    return;
+  }
+  payload = p;
+  sessionCode = code;
+  $('sessionStatus').textContent = '已加载：' + (p.edition || p.slug || '') + '，共 ' + p.lines.length + ' 句。';
+  $('editionInfo').textContent = '期次：' + (p.edition || '') + '（' + (p.slug || '') + '）· 会话码：' + code;
+  renderLines();
+  restoreClips();
+}
+function renderLines(){
+  const box = $('lines');
+  box.innerHTML = '';
+  rowUI = [];
+  clips = {};
+  payload.lines.forEach((text, idx) => {
+    const div = document.createElement('div');
+    div.className = 'line';
+    div.innerHTML = '<span class="no">第 ' + (idx+1) + ' 句 / 共 ' + payload.lines.length + ' 句</span>'
+      + '<div class="text">' + esc(text) + '</div>'
+      + '<div><button class="recBtn">● 录音</button>'
+      + '<button class="playBtn" disabled>试听</button>'
+      + '<button class="rerecordBtn" disabled>重录</button></div>'
+      + '<div class="status">未录</div>'
+      + '<audio controls style="display:none"></audio>';
+    box.appendChild(div);
+    const ui = {
+      recBtn: div.querySelector('.recBtn'),
+      playBtn: div.querySelector('.playBtn'),
+      rerecordBtn: div.querySelector('.rerecordBtn'),
+      status: div.querySelector('.status'),
+      audio: div.querySelector('audio'),
+      url: null
+    };
+    rowUI[idx] = ui;
+    ui.recBtn.onclick = () => toggleRecord(idx);
+    ui.rerecordBtn.onclick = () => { clearClip(idx).then(() => toggleRecord(idx)); };
+    ui.playBtn.onclick = () => { if (ui.audio.src) ui.audio.play(); };
+  });
+  $('linesTitle').style.display = 'block';
+  $('submitArea').style.display = 'block';
+  updateSummary();
+}
+async function restoreClips(){
+  for (let idx = 0; idx < payload.lines.length; idx++) {
+    try {
+      const saved = await idb.get(clipKey(idx));
+      if (saved && saved.blob) setClip(idx, saved.blob, saved.duration, true);
+    } catch(e) { /* 本地留存读不到不阻塞 */ }
+  }
+  updateSummary();
+}
+function setClip(idx, blob, duration, restored){
+  clips[idx] = {blob, duration};
+  const ui = rowUI[idx];
+  if (ui.url) URL.revokeObjectURL(ui.url);
+  ui.url = URL.createObjectURL(blob);
+  ui.audio.src = ui.url;
+  ui.audio.style.display = 'block';
+  ui.playBtn.disabled = false;
+  ui.rerecordBtn.disabled = false;
+  ui.status.innerHTML = '<span class="done">已录 ✓</span> ' + fmtDur(duration)
+    + ' · ' + (blob.size/1024).toFixed(1) + ' KB' + (restored ? '（浏览器本地恢复）' : '');
+}
+async function clearClip(idx){
+  delete clips[idx];
+  try { await idb.del(clipKey(idx)); } catch(e){}
+  const ui = rowUI[idx];
+  if (ui.url) { URL.revokeObjectURL(ui.url); ui.url = null; }
+  ui.audio.removeAttribute('src');
+  ui.audio.style.display = 'none';
+  ui.playBtn.disabled = true;
+  ui.rerecordBtn.disabled = true;
+  ui.status.textContent = '未录';
+  updateSummary();
+}
+
+/* ============ 录音 ============ */
+async function toggleRecord(idx){
+  if (activeRec) { if (activeRec.idx === idx) stopRecord(); return; }
+  let s;
+  try { s = await getStream(); }
+  catch(e) {
+    rowUI[idx].status.innerHTML = '<span class="missing">录音失败：' + esc(e.name) + ' — ' + esc(e.message) + '</span>';
+    return;
+  }
+  const chunks = [];
+  const recorder = new MediaRecorder(s);
+  recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  recorder.onstop = async () => {
+    const blob = new Blob(chunks, {type: recorder.mimeType || 'audio/webm'});
+    const duration = (performance.now() - activeRec.t0) / 1000;
+    activeRec = null;
+    setClip(idx, blob, duration, false);
+    try { await idb.put(clipKey(idx), {blob, duration}); } catch(e){}
+    updateSummary();
+  };
+  activeRec = {idx, recorder, t0: performance.now()};
+  recorder.start();
+  const ui = rowUI[idx];
+  ui.recBtn.textContent = '■ 停止';
+  ui.recBtn.classList.add('rec-on');
+  ui.status.textContent = '录音中… 0.0 秒（念完点「停止」）';
+  activeRec.timer = setInterval(() => {
+    ui.status.textContent = '录音中… ' + ((performance.now() - activeRec.t0)/1000).toFixed(1) + ' 秒（念完点「停止」）';
+  }, 200);
+}
+function stopRecord(){
+  if (!activeRec) return;
+  clearInterval(activeRec.timer);
+  const ui = rowUI[activeRec.idx];
+  ui.recBtn.textContent = '● 录音';
+  ui.recBtn.classList.remove('rec-on');
+  activeRec.recorder.stop();
+}
+
+/* ============ 汇总 ============ */
+function missingIndexes(){
+  const m = [];
+  for (let i = 0; i < payload.lines.length; i++) if (!clips[i]) m.push(i);
+  return m;
+}
+function updateSummary(){
+  if (!payload) return;
+  const done = payload.lines.length - missingIndexes().length;
+  $('summary').textContent = '已录 ' + done + ' / 共 ' + payload.lines.length + ' 句。';
+}
+
+/* ============ 纯 JS ZIP 打包（STORE，无压缩） ============ */
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c;
+  }
+  return t;
+})();
+function crc32(bytes){
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function buildZip(entries){ // entries: [{name, data:Uint8Array}] -> Blob
+  const enc = new TextEncoder();
+  const now = new Date();
+  const dostime = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1)) & 0xFFFF;
+  const dosdate = (((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xFFFF;
+  const parts = [];
+  const centrals = [];
+  let offset = 0;
+  for (const e of entries) {
+    const nameBytes = enc.encode(e.name);
+    const crc = crc32(e.data);
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true);
+    lh.setUint16(4, 20, true);          // version needed
+    lh.setUint16(6, 0x0800, true);      // UTF-8 filename flag
+    lh.setUint16(8, 0, true);           // method = STORE
+    lh.setUint16(10, dostime, true);
+    lh.setUint16(12, dosdate, true);
+    lh.setUint32(14, crc, true);
+    lh.setUint32(18, e.data.length, true);
+    lh.setUint32(22, e.data.length, true);
+    lh.setUint16(26, nameBytes.length, true);
+    lh.setUint16(28, 0, true);
+    parts.push(new Uint8Array(lh.buffer), nameBytes, e.data);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true);
+    ch.setUint16(4, 20, true);          // version made by
+    ch.setUint16(6, 20, true);          // version needed
+    ch.setUint16(8, 0x0800, true);
+    ch.setUint16(10, 0, true);
+    ch.setUint16(12, dostime, true);
+    ch.setUint16(14, dosdate, true);
+    ch.setUint32(16, crc, true);
+    ch.setUint32(20, e.data.length, true);
+    ch.setUint32(24, e.data.length, true);
+    ch.setUint16(28, nameBytes.length, true);
+    // extra/comment/disk/attrs all zero (30..41)
+    ch.setUint32(42, offset, true);     // local header offset
+    centrals.push(new Uint8Array(ch.buffer), nameBytes);
+    offset += 30 + nameBytes.length + e.data.length;
+  }
+  let centralSize = 0;
+  for (const c of centrals) centralSize += c.length;
+  const eo = new DataView(new ArrayBuffer(22));
+  eo.setUint32(0, 0x06054b50, true);
+  eo.setUint16(8, entries.length, true);
+  eo.setUint16(10, entries.length, true);
+  eo.setUint32(12, centralSize, true);
+  eo.setUint32(16, offset, true);
+  return new Blob([...parts, ...centrals, new Uint8Array(eo.buffer)], {type:'application/zip'});
+}
+function bytesToBase64(bytes){
+  let s = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(s);
+}
+function extFor(blob){
+  return (blob.type && blob.type.indexOf('mp4') >= 0) ? 'mp4' : 'webm';
+}
+
+/* ============ 设置：令牌与 owner ============ */
+function getOwner(){
+  const saved = localStorage.getItem('gh_owner');
+  if (saved) return saved;
+  const h = location.hostname;
+  if (h.endsWith('.github.io')) return h.split('.')[0];
+  return '';
+}
+function refreshSettingsUI(){
+  $('tokenStatus').textContent = localStorage.getItem('gh_token') ? '已保存 ✓' : '未保存';
+  const o = getOwner();
+  $('ownerHint').textContent = o ? (o + '（仓库：' + o + '/' + INBOX_REPO + '）') : '（未识别，请手动填）';
+}
+$('saveTokenBtn').onclick = () => {
+  const v = $('tokenInput').value.trim();
+  if (v) { localStorage.setItem('gh_token', v); $('tokenInput').value = ''; }
+  refreshSettingsUI();
+};
+$('saveOwnerBtn').onclick = () => {
+  const v = $('ownerInput').value.trim();
+  if (v) localStorage.setItem('gh_owner', v); else localStorage.removeItem('gh_owner');
+  refreshSettingsUI();
+};
+
+/* ============ 提交并渲染 ============ */
+$('submitBtn').onclick = async () => {
+  if (!payload) return;
+  const missing = missingIndexes();
+  const missingBox = $('missingBox');
+  if (missing.length) {
+    missingBox.style.display = 'block';
+    missingBox.textContent = '以下句子还没录：第 ' + missing.map(i => i + 1).join('、') + ' 句。';
+    const ok = confirm('还有 ' + missing.length + ' 句没录（第 ' + missing.map(i => i + 1).join('、') + ' 句）。\n缺失的句子将用克隆声补齐。确定仍要提交吗？');
+    if (!ok) return;
+  } else {
+    missingBox.style.display = 'none';
+  }
+  const token = localStorage.getItem('gh_token');
+  const owner = getOwner();
+  const prog = $('submitProgress');
+  const result = $('submitResult');
+  result.innerHTML = '';
+  if (!token) { result.innerHTML = '<div class="err">还没保存上传口令（GitHub 令牌）。先在上方设置区粘贴并保存，再提交。</div>'; return; }
+  if (!owner) { result.innerHTML = '<div class="err">识别不到仓库归属账号（owner）。请在设置区手动填写 GitHub 用户名。</div>'; return; }
+  $('submitBtn').disabled = true;
+  try {
+    prog.textContent = '1/4 正在打包…';
+    const manifestLines = [];
+    const entries = [];
+    for (let i = 0; i < payload.lines.length; i++) {
+      if (!clips[i]) continue;
+      const fname = 'line_' + String(i + 1).padStart(2, '0') + '.' + extFor(clips[i].blob);
+      manifestLines.push({n: i + 1, text: payload.lines[i], file: fname});
+      entries.push({name: fname, data: new Uint8Array(await clips[i].blob.arrayBuffer())});
+    }
+    const manifest = {edition: payload.edition || '', slug: payload.slug || '', session: sessionCode, lines: manifestLines};
+    entries.unshift({name: 'manifest.json', data: new TextEncoder().encode(JSON.stringify(manifest, null, 1))});
+    const zip = buildZip(entries);
+    prog.textContent = '2/4 打包完成（' + (zip.size/1024).toFixed(1) + ' KB，共 ' + manifestLines.length + ' 句），检查收件仓是否已有本期文件…';
+    const apiPath = 'audio-inbox/' + (payload.slug || '') + '/' + sessionCode + '/recordings.zip';
+    const url = 'https://api.github.com/repos/' + owner + '/' + INBOX_REPO + '/contents/' + apiPath;
+    const headers = {
+      'Authorization': 'Bearer ' + token,
+      'Accept': 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'Content-Type': 'application/json'
+    };
+    let sha = null;
+    const g = await fetch(url, {headers});
+    if (g.ok) { sha = (await g.json()).sha; }
+    else if (g.status !== 404) { throw new Error('检查已有文件失败：HTTP ' + g.status + ' ' + (await g.text())); }
+    prog.textContent = '3/4 正在上传到 ' + owner + '/' + INBOX_REPO + ' …';
+    const body = {
+      message: 'recordings ' + (payload.slug || '') + ' ' + sessionCode,
+      content: bytesToBase64(new Uint8Array(await zip.arrayBuffer()))
+    };
+    if (sha) body.sha = sha;
+    const r = await fetch(url, {method: 'PUT', headers, body: JSON.stringify(body)});
+    if (!r.ok) throw new Error('上传失败：HTTP ' + r.status + ' ' + (await r.text()));
+    prog.textContent = '4/4 上传完成。';
+    result.innerHTML = '<div class="ok">✓ 已提交成功。Muse 会取回这批录音并渲染成片，成片回到聊天里交付。可以回聊天说一句「录好了」催一下。</div>';
+  } catch(e) {
+    prog.textContent = '';
+    result.innerHTML = '<div class="err">提交失败：\n' + esc(e.message || e) + '</div>';
+  } finally {
+    $('submitBtn').disabled = false;
+  }
+};
+
+/* ============ 入口 ============ */
+$('loadSessionBtn').onclick = () => {
+  const code = $('sessionInput').value.trim();
+  if (code) loadSession(code);
+};
+$('usePasteBtn').onclick = () => {
+  try {
+    const p = JSON.parse($('payloadPaste').value);
+    initPayload(p, $('sessionInput').value.trim() || sessionCode || 'manual');
+  } catch(e) {
+    $('sessionStatus').innerHTML = '<span class="missing">粘贴的内容不是合法 JSON：' + esc(e.message) + '</span>';
+  }
+};
+refreshSettingsUI();
+(function boot(){
+  const code = new URLSearchParams(location.search).get('s');
+  if (code) {
+    $('sessionInput').value = code;
+    loadSession(code);
+  } else {
+    $('sessionStatus').textContent = '链接里没有会话码，请在上方输入会话码后点「加载本期口播」。';
+  }
+})();
+</script>
+</body>
+</html>
